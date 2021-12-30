@@ -46,7 +46,6 @@
 
 #include <asm/unaligned.h>
 #include <crypto/algapi.h>
-#include <crypto/gf128mul.h>
 #include <crypto/polyval.h>
 #include <crypto/internal/hash.h>
 #include <linux/crypto.h>
@@ -66,14 +65,52 @@ struct polyval_desc_ctx {
 	u32 bytes;
 };
 
-static void copy_and_reverse(u8 dst[POLYVAL_BLOCK_SIZE],
-			     const u8 src[POLYVAL_BLOCK_SIZE])
+void copy_and_reverse(u8 dst[POLYVAL_BLOCK_SIZE],
+		     const u8 src[POLYVAL_BLOCK_SIZE])
 {
 	u64 a = get_unaligned((const u64 *)&src[0]);
 	u64 b = get_unaligned((const u64 *)&src[8]);
 
 	put_unaligned(swab64(a), (u64 *)&dst[8]);
 	put_unaligned(swab64(b), (u64 *)&dst[0]);
+}
+
+/*
+ * Performs multiplication in the POLYVAL field using the GHASH field as a
+ * subroutine.  This function is used as a fallback for hardware accelerated
+ * implementations when simd registers are unavailable.
+ *
+ * Note: This function is not used for polyval-generic, instead we use the 4k
+ * lookup table implementation for finite field multiplication.
+ */
+void polyval_mul_non4k(u8 *op1, const u8 *op2)
+{
+	be128 a, b;
+
+	// Assume one argument is in Montgomery form and one is not.
+	copy_and_reverse((u8 *)&a, op1);
+	copy_and_reverse((u8 *)&b, op2);
+	gf128mul_x_lle(&a, &a);
+	gf128mul_lle(&a, &b);
+	copy_and_reverse(op1, (u8 *)&a);
+}
+
+/*
+ * Perform a POLYVAL update using non4k multiplication.  This function is used
+ * as a fallback for hardware accelerated implementations when simd registers
+ * are unavailable.
+ *
+ * Note: This function is not used for polyval-generic, instead we use the 4k
+ * lookup table implementation of finite field multiplication.
+ */
+void polyval_update_non4k(const u8 *key, const u8 *in,
+			  size_t nblocks, u8 *accumulator)
+{
+	while (nblocks--) {
+		crypto_xor(accumulator, in, POLYVAL_BLOCK_SIZE);
+		polyval_mul_non4k(accumulator, key);
+		in += POLYVAL_BLOCK_SIZE;
+	}
 }
 
 static int polyval_setkey(struct crypto_shash *tfm,
