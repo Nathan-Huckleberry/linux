@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Accelerated POLYVAL implementation with Intel PCLMULQDQ-NI
+ * Accelerated POLYVAL implementation with ARMv8 Crypto Extensions
  * instructions. This file contains glue code.
  *
  * Copyright (c) 2007 Nokia Siemens Networks - Mikko Herranen <mh1@iki.fi>
@@ -11,9 +11,8 @@
 /*
  * Glue code based on ghash-clmulni-intel_glue.c.
  *
- * This implementation of POLYVAL uses montgomery multiplication
- * accelerated by PCLMULQDQ-NI to implement the finite field
- * operations.
+ * This implementation of POLYVAL uses montgomery multiplication accelerated by
+ * ARMv8 Crypto Extensions instructions to implement the finite field operations.
  *
  */
 
@@ -26,15 +25,14 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
-#include <asm/cpu_device_id.h>
+#include <linux/cpufeature.h>
+#include <asm/neon.h>
 #include <asm/simd.h>
+#include <asm/unaligned.h>
 
 #define NUM_KEY_POWERS	8
 
 struct polyval_tfm_ctx {
-	/*
-	 * These powers must be in the order h^8, ..., h^1.
-	 */
 	u8 key_powers[NUM_KEY_POWERS][POLYVAL_BLOCK_SIZE];
 };
 
@@ -43,17 +41,17 @@ struct polyval_desc_ctx {
 	u32 bytes;
 };
 
-asmlinkage void clmul_polyval_update(const struct polyval_tfm_ctx *keys,
+asmlinkage void pmull_polyval_update(const struct polyval_tfm_ctx *keys,
 	const u8 *in, size_t nblocks, u8 *accumulator);
-asmlinkage void clmul_polyval_mul(u8 *op1, const u8 *op2);
+asmlinkage void pmull_polyval_mul(u8 *op1, const u8 *op2);
 
 static void internal_polyval_update(const struct polyval_tfm_ctx *keys,
 	const u8 *in, size_t nblocks, u8 *accumulator)
 {
 	if (likely(crypto_simd_usable())) {
-		kernel_fpu_begin();
-		clmul_polyval_update(keys, in, nblocks, accumulator);
-		kernel_fpu_end();
+		kernel_neon_begin();
+		pmull_polyval_update(keys, in, nblocks, accumulator);
+		kernel_neon_end();
 	} else {
 		polyval_update_non4k(keys->key_powers[NUM_KEY_POWERS-1], in,
 			nblocks, accumulator);
@@ -63,15 +61,15 @@ static void internal_polyval_update(const struct polyval_tfm_ctx *keys,
 static void internal_polyval_mul(u8 *op1, const u8 *op2)
 {
 	if (likely(crypto_simd_usable())) {
-		kernel_fpu_begin();
-		clmul_polyval_mul(op1, op2);
-		kernel_fpu_end();
+		kernel_neon_begin();
+		pmull_polyval_mul(op1, op2);
+		kernel_neon_end();
 	} else {
 		polyval_mul_non4k(op1, op2);
 	}
 }
 
-static int polyval_x86_setkey(struct crypto_shash *tfm,
+static int polyval_arm64_setkey(struct crypto_shash *tfm,
 			const u8 *key, unsigned int keylen)
 {
 	struct polyval_tfm_ctx *ctx = crypto_shash_ctx(tfm);
@@ -91,7 +89,7 @@ static int polyval_x86_setkey(struct crypto_shash *tfm,
 	return 0;
 }
 
-static int polyval_x86_init(struct shash_desc *desc)
+static int polyval_arm64_init(struct shash_desc *desc)
 {
 	struct polyval_desc_ctx *dctx = shash_desc_ctx(desc);
 
@@ -100,14 +98,14 @@ static int polyval_x86_init(struct shash_desc *desc)
 	return 0;
 }
 
-static int polyval_x86_update(struct shash_desc *desc,
+static int polyval_arm64_update(struct shash_desc *desc,
 			 const u8 *src, unsigned int srclen)
 {
 	struct polyval_desc_ctx *dctx = shash_desc_ctx(desc);
-	const struct polyval_tfm_ctx *ctx = crypto_shash_ctx(desc->tfm);
+	struct polyval_tfm_ctx *ctx = crypto_shash_ctx(desc->tfm);
 	u8 *pos;
 	unsigned int nblocks;
-	int n;
+	unsigned int n;
 
 	if (dctx->bytes) {
 		n = min(srclen, dctx->bytes);
@@ -121,7 +119,7 @@ static int polyval_x86_update(struct shash_desc *desc,
 
 		if (!dctx->bytes)
 			internal_polyval_mul(dctx->buffer,
-					     ctx->key_powers[NUM_KEY_POWERS-1]);
+				ctx->key_powers[NUM_KEY_POWERS-1]);
 	}
 
 	nblocks = srclen/POLYVAL_BLOCK_SIZE;
@@ -139,14 +137,14 @@ static int polyval_x86_update(struct shash_desc *desc,
 	return 0;
 }
 
-static int polyval_x86_final(struct shash_desc *desc, u8 *dst)
+static int polyval_arm64_final(struct shash_desc *desc, u8 *dst)
 {
 	struct polyval_desc_ctx *dctx = shash_desc_ctx(desc);
-	const struct polyval_tfm_ctx *ctx = crypto_shash_ctx(desc->tfm);
+	struct polyval_tfm_ctx *ctx = crypto_shash_ctx(desc->tfm);
 
 	if (dctx->bytes) {
 		internal_polyval_mul(dctx->buffer,
-				     ctx->key_powers[NUM_KEY_POWERS-1]);
+			ctx->key_powers[NUM_KEY_POWERS-1]);
 	}
 
 	dctx->bytes = 0;
@@ -157,14 +155,14 @@ static int polyval_x86_final(struct shash_desc *desc, u8 *dst)
 
 static struct shash_alg polyval_alg = {
 	.digestsize	= POLYVAL_DIGEST_SIZE,
-	.init		= polyval_x86_init,
-	.update		= polyval_x86_update,
-	.final		= polyval_x86_final,
-	.setkey		= polyval_x86_setkey,
+	.init		= polyval_arm64_init,
+	.update		= polyval_arm64_update,
+	.final		= polyval_arm64_final,
+	.setkey		= polyval_arm64_setkey,
 	.descsize	= sizeof(struct polyval_desc_ctx),
 	.base		= {
 		.cra_name		= "polyval",
-		.cra_driver_name	= "polyval-clmulni",
+		.cra_driver_name	= "polyval-ce",
 		.cra_priority		= 200,
 		.cra_blocksize		= POLYVAL_BLOCK_SIZE,
 		.cra_ctxsize		= sizeof(struct polyval_tfm_ctx),
@@ -172,29 +170,25 @@ static struct shash_alg polyval_alg = {
 	},
 };
 
-__maybe_unused static const struct x86_cpu_id pcmul_cpu_id[] = {
-	X86_MATCH_FEATURE(X86_FEATURE_PCLMULQDQ, NULL), /* Pickle-Mickle-Duck */
-	{}
-};
-MODULE_DEVICE_TABLE(x86cpu, pcmul_cpu_id);
-
-static int __init polyval_clmulni_mod_init(void)
+static int __init polyval_ce_mod_init(void)
 {
-	if (!x86_match_cpu(pcmul_cpu_id))
+	if (!cpu_have_named_feature(PMULL))
 		return -ENODEV;
 
 	return crypto_register_shash(&polyval_alg);
 }
 
-static void __exit polyval_clmulni_mod_exit(void)
+static void __exit polyval_ce_mod_exit(void)
 {
 	crypto_unregister_shash(&polyval_alg);
 }
 
-module_init(polyval_clmulni_mod_init);
-module_exit(polyval_clmulni_mod_exit);
+module_cpu_feature_match(PMULL, polyval_ce_mod_init)
+
+module_init(polyval_ce_mod_init);
+module_exit(polyval_ce_mod_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("POLYVAL hash function accelerated by PCLMULQDQ-NI");
+MODULE_DESCRIPTION("POLYVAL hash function accelerated by ARMv8 Crypto Extensions");
 MODULE_ALIAS_CRYPTO("polyval");
-MODULE_ALIAS_CRYPTO("polyval-clmulni");
+MODULE_ALIAS_CRYPTO("polyval-ce");
