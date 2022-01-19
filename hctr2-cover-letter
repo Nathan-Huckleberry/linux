@@ -1,0 +1,46 @@
+HCTR2 is a length-preserving encryption mode that is efficient on processors
+with instructions to accelerate AES and carryless multiplication, e.g. x86
+processors with AES-NI and CLMUL, and ARM processors with the ARMv8 Crypto
+Extensions.
+
+HCTR2 is a new encryption mode specifically designed for length-preserving
+encryption. HCTR2 is specified in our paper here:
+https://eprint.iacr.org/2021/1441.pdf (Length-preserving encryption with HCTR2).
+Reference code and test vectors are here: https://github.com/google/hctr2.
+
+HCTR2 is a wide-block cipher mode, meaning that it has stronger security
+properties than other encryption modes. For example, with XTS mode, a single
+bitflip in the plaintext only changes 16 bytes in the ciphertext. With HCTR2
+mode, a single bitflip changes the entire ciphertext to look completely random.
+This gives HCTR2 an advantage in applications such as disk encryption where
+localized changes are common.
+
+Moreover, when reusing IVs with XTS, CBC, CTR, etc modes, if the plaintexts
+share a blocksize prefix then the ciphertexts also share a blocksize prefix.
+This means that special care must be taken when reusing IVs for these modes.
+This problem does not occur with HCTR2 which makes it secure in certain
+applications, such as filename encryption, where IVs are reused for efficiency
+reasons.
+
+The kernel already contains a similar wide-block cipher mode called Adiantum
+which is used for low end devices without hardware cryptographic support. HCTR2
+is intended to be used on higher end devices that have hardware accelerated
+cryptography instructions.
+
+HCTR2 uses two passes of an ε-almost-∆-universal hash function called POLYVAL
+and one pass of a blockcipher mode called XCTR. POLYVAL is a well-known
+algorithm and was originally introduced for the creation of GCM-SIV. XCTR mode
+is a variant of CTR mode that is more efficient on little-endian machines.
+
+The security proof of HCTR2 asserts that if AES is secure, then HCTR2 is secure
+as well. The security proof can be seen in our paper which is linked above.
+Therefore if one has trust in AES, they can trust HCTR2 as well.
+
+This patchset adds HCTR2 to Linux's crypto API, including generic implementations
+of XCTR and POLYVAL, hardware accelerated implementations of XCTR and POLYVAL for
+both x86-64 and ARM64, and a templated implementation of HCTR2.
+
+# Please edit the description for the branch
+#   hctr2-series
+# Lines starting with '#' will be stripped.
+
