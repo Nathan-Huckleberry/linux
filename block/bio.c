@@ -2,6 +2,10 @@
 /*
  * Copyright (C) 2001 Jens Axboe <axboe@kernel.dk>
  */
+#include "linux/blk_types.h"
+#include "linux/completion.h"
+#include "linux/list.h"
+#include "linux/spinlock.h"
 #include <linux/mm.h>
 #include <linux/swap.h>
 #include <linux/bio.h>
@@ -270,6 +274,11 @@ void bio_init(struct bio *bio, struct block_device *bdev, struct bio_vec *table,
 #endif
 	bio->bi_vcnt = 0;
 
+#ifdef CONFIG_BLK_IN_WAITER
+	bio->bi_head = NULL;
+	bio->bi_waiter_target = NULL;
+#endif
+
 	atomic_set(&bio->__bi_remaining, 1);
 	atomic_set(&bio->__bi_cnt, 1);
 	bio->bi_cookie = BLK_QC_T_NONE;
@@ -336,6 +345,9 @@ void bio_chain(struct bio *bio, struct bio *parent)
 
 	bio->bi_private = parent;
 	bio->bi_end_io	= bio_chain_endio;
+#ifdef CONFIG_BLK_IN_WAITER
+	bio->bi_head	= parent->bi_head;
+#endif
 	bio_inc_remaining(parent);
 }
 EXPORT_SYMBOL(bio_chain);
@@ -762,6 +774,9 @@ static int __bio_clone(struct bio *bio, struct bio *bio_src, gfp_t gfp)
 	bio_set_flag(bio, BIO_CLONED);
 	bio->bi_ioprio = bio_src->bi_ioprio;
 	bio->bi_iter = bio_src->bi_iter;
+#ifdef CONFIG_BLK_IN_WAITER
+	bio->bi_head = bio_src->bi_head;
+#endif
 
 	if (bio->bi_bdev) {
 		if (bio->bi_bdev == bio_src->bi_bdev &&
@@ -1557,6 +1572,215 @@ again:
 }
 EXPORT_SYMBOL(bio_endio);
 
+#ifdef CONFIG_BLK_IN_WAITER
+void bio_waiter_work_list_init(struct bio_waiter_work_list *work_list)
+{
+	spin_lock_init(&work_list->list_lock);
+	INIT_LIST_HEAD(&work_list->list_head);
+	work_list->refcount = 1;
+}
+EXPORT_SYMBOL(bio_waiter_work_list_init);
+
+void bio_waiter_work_list_put(struct bio_waiter_work_list *work_list)
+{
+	spin_lock(&work_list->list_lock);
+	if (!--work_list->refcount && work_list->free_work_list) {
+		spin_unlock(&work_list->list_lock);
+		work_list->free_work_list(work_list);
+	} else
+		spin_unlock(&work_list->list_lock);
+}
+EXPORT_SYMBOL(bio_waiter_work_list_put);
+
+void bio_waiter_work_list_get(struct bio_waiter_work_list *work_list)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&work_list->list_lock, flags);
+	work_list->refcount++;
+	spin_unlock_irqrestore(&work_list->list_lock, flags);
+}
+
+/*
+ * The bio_work struct must be allocated separately from the bio since the bio
+ * may get freed before the bio_work struct is freed.
+ */
+static struct bio_work *bio_work_alloc(struct bio *bio)
+{
+	int gfp_mask = 0;
+	return mempool_alloc(&bio->bi_pool->bio_work_pool, gfp_mask);
+}
+
+static void bio_work_free(struct bio_work *bio_work)
+{
+	mempool_free(bio_work, &bio_work->bio_pool->bio_work_pool);
+}
+
+static void bio_work_uncontested(struct work_struct *wq_work)
+{
+	struct bio_work *bio_work = container_of(wq_work, struct bio_work,
+						 wq_work);
+	bio_work_t *work_func = bio_work->work_func;
+	struct bio *bio = bio_work->bio;
+
+	bio_work->handled = true;
+	bio_work_free(bio_work);
+	work_func(bio);
+}
+
+/*
+ * This function is not allowed to do anything the bio_work->bio.
+ */
+static void bio_work_wq(struct work_struct *wq_work)
+{
+	struct bio_work *bio_work = container_of(wq_work, struct bio_work,
+						 wq_work);
+	/*
+	 * Keep a reference so we can operate on the work_list after the
+	 * bio_work struct has been freed.
+	 */
+	struct bio_waiter_work_list *work_list = bio_work->work_list;
+	bio_work_t *work_func;
+	struct bio *bio;
+
+	spin_lock(&work_list->list_lock);
+
+	if (!bio_work->handled) {
+		/*
+		* The workqueue got to the work before any waiter could.
+		* Remove from the waiter's queue to avoid UAF.
+		*/
+		list_del(&bio_work->waiter_list_entry);
+		bio_work->handled = true;
+		work_func = READ_ONCE(bio_work->work_func);
+		bio = READ_ONCE(bio_work->bio);
+		spin_unlock(&work_list->list_lock);
+		/*
+		 * Freeing before doing work is important. Particularly, in the
+		 * case that the work_func calls bio_work_defer, we can run into
+		 * deadlocks if there's not enough memory to allocate a new
+		 * bio_work struct.
+		 */
+		bio_work_free(bio_work);
+		work_func(bio);
+	} else {
+		spin_unlock(&work_list->list_lock);
+		bio_work_free(bio_work);
+	}
+	bio_waiter_work_list_put(work_list);
+}
+EXPORT_SYMBOL(bio_work_defer);
+
+/*
+ * The caller must pass the same values that waiter_target->get_queue(head)) and
+ * waiter_target->get_queue_lock(head)) would return.
+ */
+void bio_work_waiter(struct bio_waiter_work_list *work_list)
+{
+	struct bio_work *bio_work;
+	struct bio *bio;
+	bio_work_t *work_func;
+
+	for (;;) {
+		spin_lock(&work_list->list_lock);
+		if (list_empty(&work_list->list_head)) {
+			spin_unlock(&work_list->list_lock);
+			break;
+		}
+		bio_work = list_first_entry(&work_list->list_head,
+					    struct bio_work, waiter_list_entry);
+		list_del(&bio_work->waiter_list_entry);
+		if (!bio_work->handled) {
+			bio_work->handled = true;
+			work_func = READ_ONCE(bio_work->work_func);
+			bio = READ_ONCE(bio_work->bio);
+			spin_unlock(&work_list->list_lock);
+			/*
+			 * At this point the bio_work struct may have already
+			 * been freed by the work-queue.
+			 */
+			work_func(bio);
+		} else
+			spin_unlock(&work_list->list_lock);
+	}
+}
+EXPORT_SYMBOL(bio_work_waiter);
+
+void bio_work_enqueue(struct bio_work *work)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&work->work_list->list_lock, flags);
+	list_add_tail(&work->waiter_list_entry, &work->work_list->list_head);
+	spin_unlock_irqrestore(&work->work_list->list_lock, flags);
+}
+
+/**
+ * bio_defer_work - try to defer work to process context of any IO waiters
+ * @bio:		bio that needs deferred processing
+ * @work:		work function to be called on bio
+ * @fallback_wq:	fallback workqueue to use if original IO submitter is
+ * 			unavailable
+ *
+ * Submits a work item to be run in the context of the original IO submitter.
+ * This helps the scheduler and decreases latency for the following reasons:
+ *
+ * - A scheduler call can be skipped between the workqueue finishing and the
+ *   process waking.
+ * - Postprocessing is scheduled using the priority of the original IO
+ *   submitter.
+ * - Postprocessing contributes to the original IO submitters timeslice.
+ * - Postprocessing for synchronous reads will not be blocked by async reads.
+ *
+ * Targets which do postprocessing in a workqueue should prefer using this
+ * wrapper over using a workqueue directly.
+ *
+ * If the original IO submitter is unavailable (async IO or upper layers haven't
+ * implemented bi_defer_work), we fallback to @fallback_wq.
+ *
+ */
+void bio_work_defer(struct bio *bio, bio_work_t *work,
+		    struct workqueue_struct *fallback_wq)
+{
+	struct bio_work *bio_work = bio_work_alloc(bio);
+	struct bio_waiter_target *waiter_target;
+
+	if (!bio_work) {
+		bio->bi_status = BLK_STS_RESOURCE;
+		bio_endio(bio);
+		printk(KERN_WARNING "Could not allocate bio_work\n");
+		return;
+	}
+
+	bio_work->bio = bio;
+	bio_work->bio_pool = bio->bi_pool;
+	bio_work->handled = false;
+	bio_work->work_func = work;
+	bio_work->work_list = NULL;
+
+	if (bio->bi_head && bio->bi_head->bi_waiter_target) {
+		waiter_target = bio->bi_head->bi_waiter_target;
+		bio_work->work_list =
+		    waiter_target->map_bio_to_work_list(bio->bi_head);
+		if (!bio_work->work_list) {
+			// There is no work list, fallback to wq only.
+			INIT_WORK(&bio_work->wq_work, bio_work_uncontested);
+			queue_work(fallback_wq, &bio_work->wq_work);
+		}
+		bio_waiter_work_list_get(bio_work->work_list);
+		bio_work_enqueue(bio_work);
+
+		waiter_target->wake_one_waiter(bio->bi_head);
+		INIT_WORK(&bio_work->wq_work, bio_work_wq);
+		queue_work(fallback_wq, &bio_work->wq_work);
+	} else {
+		// There is no waiter, fallback to wq only.
+		INIT_WORK(&bio_work->wq_work, bio_work_uncontested);
+		queue_work(fallback_wq, &bio_work->wq_work);
+	}
+}
+#endif
+
 /**
  * bio_split - split a bio
  * @bio:	bio to split
@@ -1654,6 +1878,9 @@ void bioset_exit(struct bio_set *bs)
 
 	mempool_exit(&bs->bio_pool);
 	mempool_exit(&bs->bvec_pool);
+#ifdef CONFIG_BLK_IN_WAITER
+	mempool_exit(&bs->bio_work_pool);
+#endif
 
 	bioset_integrity_free(bs);
 	if (bs->bio_slab)
@@ -1704,6 +1931,11 @@ int bioset_init(struct bio_set *bs,
 
 	if (mempool_init_slab_pool(&bs->bio_pool, pool_size, bs->bio_slab))
 		goto bad;
+
+#ifdef CONFIG_BLK_IN_WAITER
+	if (mempool_init_slab_pool(&bs->bio_work_pool, pool_size, bs->bio_slab))
+		goto bad;
+#endif
 
 	if ((flags & BIOSET_NEED_BVECS) &&
 	    biovec_init_pool(&bs->bvec_pool, pool_size))

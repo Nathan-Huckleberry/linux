@@ -245,6 +245,37 @@ typedef __u32 __bitwise blk_opf_t;
 typedef unsigned int blk_qc_t;
 #define BLK_QC_T_NONE		-1U
 
+#ifdef CONFIG_BLK_IN_WAITER
+struct bio_waiter_work_list;
+
+typedef void (*bio_work_list_free_fn) (struct bio_waiter_work_list *);
+typedef void (*bio_wake_one_waiter_fn) (struct bio *);
+typedef struct bio_waiter_work_list * (*map_bio_to_work_list_fn) (struct bio *);
+typedef void (bio_work_t) (struct bio *);
+
+struct bio_waiter_work_list {
+	spinlock_t list_lock;
+	struct list_head list_head;
+	int refcount;
+	bio_work_list_free_fn free_work_list;
+};
+
+struct bio_waiter_target {
+	bio_wake_one_waiter_fn wake_one_waiter;
+	map_bio_to_work_list_fn map_bio_to_work_list;
+};
+
+struct bio_work {
+	struct work_struct wq_work;
+	struct list_head waiter_list_entry;
+	struct bio *bio;
+	struct bio_set *bio_pool;
+	bio_work_t *work_func;
+	bool handled;
+	struct bio_waiter_work_list *work_list;
+};
+#endif
+
 /*
  * main unit of I/O for the block layer and lower layers (ie drivers and
  * stacking drivers)
@@ -288,6 +319,12 @@ struct bio {
 		struct bio_integrity_payload *bi_integrity; /* data integrity */
 #endif
 	};
+
+#ifdef CONFIG_BLK_IN_WAITER
+	/* the original bio that upper layers are waiting on */
+	struct bio		*bi_head;
+	struct bio_waiter_target *bi_waiter_target;
+#endif
 
 	unsigned short		bi_vcnt;	/* how many bio_vec's */
 

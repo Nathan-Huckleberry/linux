@@ -426,6 +426,13 @@ static inline struct bio *bio_alloc(struct block_device *bdev,
 void submit_bio(struct bio *bio);
 
 extern void bio_endio(struct bio *);
+#ifdef CONFIG_BLK_IN_WAITER
+extern void bio_work_defer(struct bio * bio, bio_work_t * work_list,
+			   struct workqueue_struct * fallback_wq);
+extern void bio_work_waiter(struct bio_waiter_work_list *work_list);
+extern void bio_waiter_work_list_init(struct bio_waiter_work_list *work_list);
+extern void bio_waiter_work_list_put(struct bio_waiter_work_list *work_list);
+#endif
 
 static inline void bio_io_error(struct bio *bio)
 {
@@ -663,6 +670,9 @@ struct bio_set {
 #if defined(CONFIG_BLK_DEV_INTEGRITY)
 	mempool_t bio_integrity_pool;
 	mempool_t bvec_integrity_pool;
+#endif
+#ifdef CONFIG_BLK_IN_WAITER
+	mempool_t bio_work_pool;
 #endif
 
 	unsigned int back_pad;

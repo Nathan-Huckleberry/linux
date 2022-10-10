@@ -203,6 +203,13 @@ config BLK_INLINE_ENCRYPTION_FALLBACK
 	  by falling back to the kernel crypto API when inline
 	  encryption hardware is not present.
 
+config BLK_IN_WAITER
+	bool "Enable in-waiter bio post-processing"
+	help
+	  Enabling this allows post-processing for bios to be performed in any
+	  IO waiters. This can decrease latency for block devices or filesystems
+	  that require intensive post-processing.
+
 source "block/partitions/Kconfig"
 
 config BLOCK_COMPAT
