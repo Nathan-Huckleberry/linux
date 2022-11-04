@@ -146,3 +146,18 @@ void putback_lru_page(struct page *page)
 {
 	folio_putback_lru(page_folio(page));
 }
+
+#ifdef CONFIG_BLK_IN_WAITER
+void page_wake_for_bio_work(struct page *page)
+{
+	folio_wake_for_bio_work(page_folio(page));
+}
+EXPORT_SYMBOL(page_wake_for_bio_work);
+
+struct bio_waiter_work_list *page_get_waiter_work_list(struct page *page)
+{
+	return folio_get_waiter_work_list(page_folio(page));
+}
+EXPORT_SYMBOL(page_get_waiter_work_list);
+#endif
+

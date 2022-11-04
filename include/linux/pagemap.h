@@ -857,6 +857,9 @@ struct wait_page_key {
 	struct folio *folio;
 	int bit_nr;
 	int page_match;
+#ifdef CONFIG_BLK_IN_WAITER
+	bool bio_work;
+#endif
 };
 
 struct wait_page_queue {
@@ -884,6 +887,13 @@ bool __folio_lock_or_retry(struct folio *folio, struct mm_struct *mm,
 				unsigned int flags);
 void unlock_page(struct page *page);
 void folio_unlock(struct folio *folio);
+
+#ifdef CONFIG_BLK_IN_WAITER
+void page_wake_for_bio_work(struct page *page);
+void folio_wake_for_bio_work(struct folio *folio);
+struct bio_waiter_work_list *folio_get_waiter_work_list(struct folio *folio);
+struct bio_waiter_work_list *page_get_waiter_work_list(struct page *page);
+#endif
 
 /**
  * folio_trylock() - Attempt to lock a folio.

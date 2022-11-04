@@ -90,6 +90,27 @@ static void __read_end_io(struct bio *bio)
 	bio_put(bio);
 }
 
+#ifdef CONFIG_BLK_IN_WAITER
+void ext4_wake_waiter_for_bio(struct bio *bio)
+{
+	struct page *page = bio_first_page_all(bio);
+
+	page_wake_for_bio_work(page);
+}
+
+struct bio_waiter_work_list *ext4_map_bio_to_work_list(struct bio *bio)
+{
+	struct page *page = bio_first_page_all(bio);
+
+	return page_get_waiter_work_list(page);
+}
+
+struct bio_waiter_target ext4_bio_waiter_target = {
+	.wake_one_waiter = ext4_wake_waiter_for_bio,
+	.map_bio_to_work_list = ext4_map_bio_to_work_list,
+};
+#endif
+
 static void bio_post_read_processing(struct bio_post_read_ctx *ctx);
 
 static void decrypt_work(struct work_struct *work)
@@ -374,6 +395,10 @@ int ext4_mpage_readpages(struct inode *inode,
 			ext4_set_bio_post_read_ctx(bio, inode, page->index);
 			bio->bi_iter.bi_sector = blocks[0] << (blkbits - 9);
 			bio->bi_end_io = mpage_end_io;
+#ifdef CONFIG_BLK_IN_WAITER
+			bio->bi_head = bio;
+			bio->bi_waiter_target = &ext4_bio_waiter_target;
+#endif
 			if (rac)
 				bio->bi_opf |= REQ_RAHEAD;
 		}

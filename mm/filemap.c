@@ -42,6 +42,7 @@
 #include <linux/ramfs.h>
 #include <linux/page_idle.h>
 #include <linux/migrate.h>
+#include <linux/bio.h>
 #include <asm/pgalloc.h>
 #include <asm/tlbflush.h>
 #include "internal.h"
@@ -1030,12 +1031,26 @@ static wait_queue_head_t *folio_waitqueue(struct folio *folio)
 	return &folio_wait_table[hash_ptr(folio, PAGE_WAIT_TABLE_BITS)];
 }
 
+#ifdef CONFIG_BLK_IN_WAITER
+static struct bio_waiter_work_list bio_waiter_work_lists[PAGE_WAIT_TABLE_SIZE] __cacheline_aligned;
+
+struct bio_waiter_work_list *folio_get_waiter_work_list(struct folio *folio)
+{
+	return &bio_waiter_work_lists[hash_ptr(folio, PAGE_WAIT_TABLE_BITS)];
+}
+EXPORT_SYMBOL(folio_get_waiter_work_list);
+#endif
+
 void __init pagecache_init(void)
 {
 	int i;
 
-	for (i = 0; i < PAGE_WAIT_TABLE_SIZE; i++)
+	for (i = 0; i < PAGE_WAIT_TABLE_SIZE; i++) {
 		init_waitqueue_head(&folio_wait_table[i]);
+#ifdef CONFIG_BLK_IN_WAITER
+		bio_waiter_work_list_init(&bio_waiter_work_lists[i]);
+#endif
+	}
 
 	page_writeback_init();
 }
@@ -1084,11 +1099,29 @@ static int wake_page_function(wait_queue_entry_t *wait, unsigned mode, int sync,
 	if (!wake_page_match(wait_page, key))
 		return 0;
 
+	flags = wait->flags;
+#ifdef CONFIG_BLK_IN_WAITER
+	if (key->bio_work) {
+		/*
+		 * We are holding the wait-queue lock, but the waiter that is
+		 * waiting is checking the flags without any locking.
+		 *
+		 * Update the flags, and wake up the waiter afterwards to avoid
+		 * any races. This store-release pairs with the load-acquire in
+		 * folio_wait_bit_common().
+		 */
+		smp_store_release(&wait->flags, flags | WQ_FLAG_WOKEN |
+						WQ_FLAG_BIO_WORK);
+		wake_up_state(wait->private, mode);
+		list_del_init_careful(&wait->entry);
+	} else
+		flags &= ~WQ_FLAG_BIO_WORK;
+#endif
+
 	/*
 	 * If it's a lock handoff wait, we get the bit for it, and
 	 * stop walking (and do not wake it up) if we can't.
 	 */
-	flags = wait->flags;
 	if (flags & WQ_FLAG_EXCLUSIVE) {
 		if (test_bit(key->bit_nr, &key->folio->flags))
 			return -1;
@@ -1135,6 +1168,15 @@ static void folio_wake_bit(struct folio *folio, int bit_nr)
 	key.folio = folio;
 	key.bit_nr = bit_nr;
 	key.page_match = 0;
+
+#ifdef CONFIG_BLK_IN_WAITER
+	key.bio_work = false;
+	if (bit_nr == PG_bio_work) {
+		set_bit(PG_bio_work, &folio->flags);
+		key.bit_nr = PG_locked;
+		key.bio_work = true;
+	}
+#endif
 
 	bookmark.flags = 0;
 	bookmark.private = NULL;
@@ -1218,6 +1260,9 @@ static inline int folio_wait_bit_common(struct folio *folio, int bit_nr,
 		int state, enum behavior behavior)
 {
 	wait_queue_head_t *q = folio_waitqueue(folio);
+#ifdef CONFIG_BLK_IN_WAITER
+	struct bio_waiter_work_list *work_list = folio_get_waiter_work_list(folio);
+#endif
 	int unfairness = sysctl_page_lock_unfairness;
 	struct wait_page_queue wait_page;
 	wait_queue_entry_t *wait = &wait_page.wait;
@@ -1245,6 +1290,10 @@ repeat:
 			wait->flags |= WQ_FLAG_CUSTOM;
 	}
 
+#ifdef CONFIG_BLK_IN_WAITER
+	if (test_bit(PG_bio_work, &folio->flags))
+		bio_work_waiter(folio_get_waiter_work_list(folio));
+#endif
 	/*
 	 * Do one last check whether we can get the
 	 * page bit synchronously.
@@ -1290,12 +1339,24 @@ repeat:
 		/* Loop until we've been woken or interrupted */
 		flags = smp_load_acquire(&wait->flags);
 		if (!(flags & WQ_FLAG_WOKEN)) {
-			if (signal_pending_state(state, current))
+			if (signal_pending_state(state, current)) {
+#ifdef CONFIG_BLK_IN_WAITER
+				bio_work_waiter(work_list);
+#endif
 				break;
+			}
 
 			io_schedule();
 			continue;
 		}
+
+#ifdef CONFIG_BLK_IN_WAITER
+		if (flags & WQ_FLAG_BIO_WORK) {
+			bio_work_waiter(work_list);
+			unfairness = sysctl_page_lock_unfairness;
+			goto repeat;
+		}
+#endif
 
 		/* If we were non-exclusive, we're done */
 		if (behavior != EXCLUSIVE)
@@ -1526,6 +1587,14 @@ void folio_unlock(struct folio *folio)
 		folio_wake_bit(folio, PG_locked);
 }
 EXPORT_SYMBOL(folio_unlock);
+
+#ifdef CONFIG_BLK_IN_WAITER
+void folio_wake_for_bio_work(struct folio *folio)
+{
+	folio_wake_bit(folio, PG_bio_work);
+}
+EXPORT_SYMBOL(folio_wake_for_bio_work);
+#endif
 
 /**
  * folio_end_private_2 - Clear PG_private_2 and wake any waiters.
