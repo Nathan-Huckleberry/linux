@@ -1307,9 +1307,59 @@ int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
 }
 EXPORT_SYMBOL_GPL(bio_iov_iter_get_pages);
 
+struct submit_bio_wait_private {
+	struct completion *completion;
+#ifdef CONFIG_BLK_IN_WAITER
+	int references;
+	struct bio_waiter_work_list work_list;
+#endif
+};
+
+#ifdef CONFIG_BLK_IN_WAITER
+struct bio_waiter_work_list *submit_bio_wait_work_list_map(struct bio *bio)
+{
+	struct submit_bio_wait_private *private = bio->bi_private;
+
+	return &private->work_list;
+}
+
+static void submit_bio_wait_wake_waiter(struct bio *bio)
+{
+	struct submit_bio_wait_private *private = bio->bi_private;
+	unsigned long flags;
+
+	spin_lock_irqsave(&private->work_list.list_lock, flags);
+	bio->bi_flags |= BIO_WORK;
+	complete(private->completion);
+	spin_unlock_irqrestore(&private->work_list.list_lock, flags);
+}
+
+static void submit_bio_wait_free_work_list(struct bio_waiter_work_list *work_list)
+{
+	struct submit_bio_wait_private *private = container_of(work_list,
+		struct submit_bio_wait_private, work_list);
+
+	kfree(private);
+}
+
+struct bio_waiter_target submit_bio_wait_target = {
+	.wake_one_waiter = submit_bio_wait_wake_waiter,
+	.map_bio_to_work_list = submit_bio_wait_work_list_map,
+};
+#endif
+
 static void submit_bio_wait_endio(struct bio *bio)
 {
-	complete(bio->bi_private);
+	struct submit_bio_wait_private *private = bio->bi_private;
+
+#ifdef CONFIG_BLK_IN_WAITER
+	spin_lock(&private->work_list.list_lock);
+	bio->bi_flags &= ~BIO_WORK;
+	complete(private->completion);
+	spin_unlock(&private->work_list.list_lock);
+#else
+	complete(private->completion);
+#endif
 }
 
 /**
@@ -1328,12 +1378,57 @@ int submit_bio_wait(struct bio *bio)
 	DECLARE_COMPLETION_ONSTACK_MAP(done,
 			bio->bi_bdev->bd_disk->lockdep_map);
 	unsigned long hang_check;
+	struct submit_bio_wait_private private_stack;
+	struct submit_bio_wait_private *private;
+#ifdef CONFIG_BLK_IN_WAITER
+	bool work_in_waiter;
 
-	bio->bi_private = &done;
+	private = kzalloc(sizeof(struct
+			submit_bio_wait_private), GFP_KERNEL);
+	work_in_waiter = private != NULL;
+	if (work_in_waiter) {
+		bio->bi_waiter_target = &submit_bio_wait_target;
+		private->work_list.free_work_list =
+			submit_bio_wait_free_work_list;
+	} else
+		private = &private_stack;
+	bio_waiter_work_list_init(&private->work_list);
+	bio->bi_head = bio;
+#else
+	private = &private_stack;
+#endif
+	private->completion = &done;
+
+	bio->bi_private = private;
 	bio->bi_end_io = submit_bio_wait_endio;
 	bio->bi_opf |= REQ_SYNC;
 	submit_bio(bio);
 
+#ifdef CONFIG_BLK_IN_WAITER
+	for (;;) {
+		/* Prevent hang_check timer from firing at us during very long I/O */
+		hang_check = sysctl_hung_task_timeout_secs;
+		if (hang_check)
+			while (!wait_for_completion_io_timeout(&done,
+						hang_check * (HZ/2)))
+				;
+		else
+			wait_for_completion_io(&done);
+
+		if (work_in_waiter) {
+			spin_lock(&private->work_list.list_lock);
+			if (!(bio->bi_flags & BIO_WORK)) {
+				spin_unlock(&private->work_list.list_lock);
+				break;
+			}
+			reinit_completion(&done);
+			spin_unlock(&private->work_list.list_lock);
+			bio_work_waiter(&private->work_list);
+		} else
+			break;
+	}
+	bio_waiter_work_list_put(&private->work_list);
+#else
 	/* Prevent hang_check timer from firing at us during very long I/O */
 	hang_check = sysctl_hung_task_timeout_secs;
 	if (hang_check)
@@ -1342,6 +1437,7 @@ int submit_bio_wait(struct bio *bio)
 			;
 	else
 		wait_for_completion_io(&done);
+#endif
 
 	return blk_status_to_errno(bio->bi_status);
 }
