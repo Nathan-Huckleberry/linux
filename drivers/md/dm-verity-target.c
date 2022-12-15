@@ -624,6 +624,18 @@ static void verity_finish_io(struct dm_verity_io *io, blk_status_t status)
 	bio_endio(bio);
 }
 
+#ifdef CONFIG_BLK_IN_WAITER
+static void verity_work_in_waiter(struct bio *bio)
+{
+	struct dm_verity_io *io = bio->bi_private;
+
+	io->in_tasklet = false;
+
+	verity_fec_init_io(io);
+	verity_finish_io(io, errno_to_blk_status(verity_verify_io(io)));
+}
+#endif
+
 static void verity_work(struct work_struct *w)
 {
 	struct dm_verity_io *io = container_of(w, struct dm_verity_io, work);
@@ -665,8 +677,12 @@ static void verity_end_io(struct bio *bio)
 		tasklet_init(&io->tasklet, verity_tasklet, (unsigned long)io);
 		tasklet_schedule(&io->tasklet);
 	} else {
+#ifdef CONFIG_BLK_IN_WAITER
+		bio_work_defer(bio, verity_work_in_waiter, io->v->verify_wq);
+#else
 		INIT_WORK(&io->work, verity_work);
 		queue_work(io->v->verify_wq, &io->work);
+#endif
 	}
 }
 
