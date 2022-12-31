@@ -953,6 +953,12 @@ config CRYPTO_MD5
 	help
 	  MD5 message digest algorithm (RFC1321)
 
+config CRYPTO_TRIVIAL
+	tristate "TRIVIAL HASH"
+	select CRYPTO_HASH
+	help
+	  Trivial hash algorithm for benchmarking
+
 config CRYPTO_MICHAEL_MIC
 	tristate "Michael MIC"
 	select CRYPTO_HASH

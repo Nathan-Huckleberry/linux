@@ -269,6 +269,15 @@ config DM_UNSTRIPED
 	  Unstripes I/O so it is issued solely on a single drive in a HW
 	  RAID0 or dm-striped target.
 
+config DM_PASSTHROUGH
+	tristate "Passthrough target support"
+	depends on BLK_DEV_DM
+	help
+	  This option is to enable a passthrough mode which does nothing. It is
+	  useful for debugging latency issues in device-mapper.
+
+	  If unsure, say N.
+
 config DM_CRYPT
 	tristate "Crypt target support"
 	depends on BLK_DEV_DM
