@@ -134,6 +134,10 @@ struct workqueue_attrs {
 	 * @nice: nice level
 	 */
 	int nice;
+	/**
+	 * @low_rt: is low priority real-time
+	 */
+	bool low_rt;
 
 	/**
 	 * @cpumask: allowed CPUs
@@ -334,6 +338,11 @@ enum {
 	 * http://thread.gmane.org/gmane.linux.kernel/1480396
 	 */
 	WQ_POWER_EFFICIENT	= 1 << 7,
+	/*
+	 * Low real-time priority workqueues can reduce scheduler latency
+	 * for CPU intensive, latency sensitive workloads like IO post-processing.
+	 */
+	WQ_LOW_RTPRI		= 1 << 8,
 
 	__WQ_DRAINING		= 1 << 16, /* internal: workqueue is draining */
 	__WQ_ORDERED		= 1 << 17, /* internal: workqueue is ordered */

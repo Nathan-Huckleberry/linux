@@ -85,7 +85,7 @@ enum {
 	WORKER_NOT_RUNNING	= WORKER_PREP | WORKER_CPU_INTENSIVE |
 				  WORKER_UNBOUND | WORKER_REBOUND,
 
-	NR_STD_WORKER_POOLS	= 2,		/* # standard pools per cpu */
+	NR_STD_WORKER_POOLS	= 3,		/* # standard pools per cpu */
 
 	UNBOUND_POOL_HASH_ORDER	= 6,		/* hashed by pool->attrs */
 	BUSY_WORKER_HASH_ORDER	= 6,		/* 64 pointers */
@@ -1942,7 +1942,8 @@ static struct worker *create_worker(struct worker_pool *pool)
 
 	if (pool->cpu >= 0)
 		snprintf(id_buf, sizeof(id_buf), "%d:%d%s", pool->cpu, id,
-			 pool->attrs->nice < 0  ? "H" : "");
+			 pool->attrs->low_rt ? "RT" :
+			 (pool->attrs->nice < 0  ? "H" : ""));
 	else
 		snprintf(id_buf, sizeof(id_buf), "u%d:%d", pool->id, id);
 
@@ -1951,7 +1952,11 @@ static struct worker *create_worker(struct worker_pool *pool)
 	if (IS_ERR(worker->task))
 		goto fail;
 
-	set_user_nice(worker->task, pool->attrs->nice);
+	if (pool->attrs->low_rt)
+		sched_set_fifo_low(worker->task);
+	else
+		set_user_nice(worker->task, pool->attrs->nice);
+
 	kthread_bind_mask(worker->task, pool->attrs->cpumask);
 
 	/* successful, attach the worker to the pool */
@@ -4202,8 +4207,16 @@ out_unlock:
 
 static int alloc_and_link_pwqs(struct workqueue_struct *wq)
 {
-	bool highpri = wq->flags & WQ_HIGHPRI;
+	int pool_index = 0;
 	int cpu, ret;
+
+	if (wq->flags & WQ_HIGHPRI && wq->flags & WQ_LOW_RTPRI)
+		return -EINVAL;
+
+	if (wq->flags & WQ_HIGHPRI)
+		pool_index = 1;
+	if (wq->flags & WQ_LOW_RTPRI)
+		pool_index = 2;
 
 	if (!(wq->flags & WQ_UNBOUND)) {
 		wq->cpu_pwqs = alloc_percpu(struct pool_workqueue);
@@ -4216,7 +4229,7 @@ static int alloc_and_link_pwqs(struct workqueue_struct *wq)
 			struct worker_pool *cpu_pools =
 				per_cpu(cpu_worker_pools, cpu);
 
-			init_pwq(pwq, wq, &cpu_pools[highpri]);
+			init_pwq(pwq, wq, &cpu_pools[pool_index]);
 
 			mutex_lock(&wq->mutex);
 			link_pwq(pwq);
@@ -4227,13 +4240,13 @@ static int alloc_and_link_pwqs(struct workqueue_struct *wq)
 
 	cpus_read_lock();
 	if (wq->flags & __WQ_ORDERED) {
-		ret = apply_workqueue_attrs(wq, ordered_wq_attrs[highpri]);
+		ret = apply_workqueue_attrs(wq, ordered_wq_attrs[pool_index]);
 		/* there should only be single pwq for ordering guarantee */
 		WARN(!ret && (wq->pwqs.next != &wq->dfl_pwq->pwqs_node ||
 			      wq->pwqs.prev != &wq->dfl_pwq->pwqs_node),
 		     "ordering guarantee broken for workqueue %s\n", wq->name);
 	} else {
-		ret = apply_workqueue_attrs(wq, unbound_std_wq_attrs[highpri]);
+		ret = apply_workqueue_attrs(wq, unbound_std_wq_attrs[pool_index]);
 	}
 	cpus_read_unlock();
 
@@ -5997,7 +6010,8 @@ static void __init wq_numa_init(void)
  */
 void __init workqueue_init_early(void)
 {
-	int std_nice[NR_STD_WORKER_POOLS] = { 0, HIGHPRI_NICE_LEVEL };
+	int std_nice[NR_STD_WORKER_POOLS] = { 0, HIGHPRI_NICE_LEVEL, 0 };
+	bool std_low_rt[NR_STD_WORKER_POOLS] = { false, false, true };
 	int i, cpu;
 
 	BUILD_BUG_ON(__alignof__(struct pool_workqueue) < __alignof__(long long));
@@ -6017,8 +6031,10 @@ void __init workqueue_init_early(void)
 			BUG_ON(init_worker_pool(pool));
 			pool->cpu = cpu;
 			cpumask_copy(pool->attrs->cpumask, cpumask_of(cpu));
-			pool->attrs->nice = std_nice[i++];
+			pool->attrs->nice = std_nice[i];
+			pool->attrs->low_rt = std_low_rt[i];
 			pool->node = cpu_to_node(cpu);
+			i++;
 
 			/* alloc pool ID */
 			mutex_lock(&wq_pool_mutex);
@@ -6033,6 +6049,7 @@ void __init workqueue_init_early(void)
 
 		BUG_ON(!(attrs = alloc_workqueue_attrs()));
 		attrs->nice = std_nice[i];
+		attrs->low_rt = std_low_rt[i];
 		unbound_std_wq_attrs[i] = attrs;
 
 		/*
@@ -6042,6 +6059,7 @@ void __init workqueue_init_early(void)
 		 */
 		BUG_ON(!(attrs = alloc_workqueue_attrs()));
 		attrs->nice = std_nice[i];
+		attrs->low_rt = std_low_rt[i];
 		attrs->no_numa = true;
 		ordered_wq_attrs[i] = attrs;
 	}
